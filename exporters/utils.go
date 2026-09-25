@@ -3,6 +3,7 @@ package exporters
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	gnocchiv2 "github.com/gophercloud/utils/v2/gnocchi"
 	clientconfigv2 "github.com/gophercloud/utils/v2/openstack/clientconfig"
+	"github.com/mitchellh/go-homedir"
 )
 
 var serviceCatalogTypesByExporterService = map[string][]string{
@@ -48,6 +50,11 @@ func AuthenticatedClientV2(opts *clientconfigv2.ClientOpts, transport http.Round
 	options.AllowReauth = true
 
 	client, err := openstackv2.NewClient(options.IdentityEndpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	err = setupClientTLS(client, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -327,4 +334,76 @@ func isServiceAvailable(providerClient *gophercloudv2.ProviderClient, endpointOp
 func IsExporterNameValid(service string) bool {
 	_, ok := serviceCatalogTypesByExporterService[service]
 	return ok
+}
+
+func setupClientTLS(client *gophercloudv2.ProviderClient, opts *clientconfigv2.ClientOpts) error {
+	config, err := clientconfigv2.GetCloudFromYAML(opts)
+	if err != nil {
+		return err
+	}
+
+	var configureTransport = false
+	var tlsConfig tls.Config
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if !*config.Verify {
+		logger.Info("SSL verification disabled on transport")
+		tlsConfig.InsecureSkipVerify = true
+		configureTransport = true
+	} else if config.CACertFile != "" {
+		certPool, err := additionalTLSTrust(config.CACertFile, logger)
+		if err != nil {
+			logger.Error("Failed to include additional certificates to ca-trust", "err", err)
+		}
+		tlsConfig.RootCAs = certPool
+		configureTransport = true
+	}
+
+	// https://github.com/gophercloud/utils/blob/4c0f6d93d3a9b027a21d9206b6bdd09123de7a09/internal/util.go#L65
+	if config.ClientCertFile != "" && config.ClientKeyFile != "" {
+		clientCert, _, err := pathOrContents(config.ClientCertFile)
+		if err != nil {
+			return fmt.Errorf("error reading Client Cert: %s", err)
+		}
+		clientKey, _, err := pathOrContents(config.ClientKeyFile)
+		if err != nil {
+			return fmt.Errorf("error reading Client Key: %s", err)
+		}
+		cert, err := tls.X509KeyPair(clientCert, clientKey)
+		if err != nil {
+			return err
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		configureTransport = true
+	}
+	if configureTransport {
+		transport := &http.Transport{TLSClientConfig: &tlsConfig}
+		client.HTTPClient.Transport = transport
+	}
+	return nil
+}
+
+// https://github.com/gophercloud/utils/blob/4c0f6d93d3a9b027a21d9206b6bdd09123de7a09/internal/util.go#L87
+func pathOrContents(poc string) ([]byte, bool, error) {
+	if len(poc) == 0 {
+		return nil, false, nil
+	}
+
+	path := poc
+	if path[0] == '~' {
+		var err error
+		path, err = homedir.Expand(path)
+		if err != nil {
+			return []byte(path), true, err
+		}
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return contents, true, err
+		}
+		return contents, true, nil
+	}
+
+	return []byte(poc), false, nil
 }
